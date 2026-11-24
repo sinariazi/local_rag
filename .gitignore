@@ -1,0 +1,5 @@
+.venv/
+.rag_index/
+__pycache__/
+*.py[cod]
+.DS_Store

@@ -64,22 +64,184 @@ python rag.py ask "Explain Atlas" --chat-model gemma3:4b
 
 Changing the **embedding** model requires rebuilding the index; the query always uses the embedding model recorded in index metadata.
 
-## Architecture
+## Solution architecture
 
-```text
-.txt / .md / .pdf
-    -> read_document_sections()
-    -> split_into_chunks()
-    -> embed_texts()                 POST http://localhost:11434/api/embed
-    -> embeddings.npy + metadata.json
+### Architecture overview
 
-question
-    -> embed_texts()                 POST http://localhost:11434/api/embed
-    -> rank_documents()             normalized dot product = cosine similarity
-    -> top-k passages + source labels
-    -> generate_answer()            POST http://localhost:11434/api/chat
-    -> answer + retrieved sources
+The system is a local-first, framework-free RAG application. It separates document indexing from query-time retrieval and generation. Python owns orchestration, document processing, persistence and ranking; Ollama serves the two AI models through HTTP. No external vector database, hosted LLM or model training is required.
+
+```mermaid
+flowchart LR
+    U["User / Terminal"] --> CLI
+
+    subgraph PY["Python application — rag.py"]
+        CLI["CLI — argparse"]
+        ING["Document ingestion — pathlib / pypdf"]
+        CH["Word-based chunking"]
+        EMB["Embedding client — requests"]
+        IDX["Index builder / loader"]
+        RET["Exact cosine retrieval — NumPy"]
+        GEN["Context assembly and generation"]
+        CLI -->|index| ING
+        ING --> CH
+        CH -->|document chunks| EMB
+        CH -->|chunk records| IDX
+        EMB -->|document vectors| IDX
+        CLI -->|search or ask| RET
+        RET -->|question| EMB
+        EMB -->|query vector| RET
+        IDX -->|stored records and vectors| RET
+        RET -->|ask: top-k chunks| GEN
+    end
+
+    subgraph FS["Local filesystem"]
+        DOC["Documents — TXT, MD, PDF"]
+        META["metadata.json"]
+        VEC["embeddings.npy"]
+    end
+
+    subgraph OL["Ollama server — localhost:11434 by default"]
+        E["EmbeddingGemma — /api/embed"]
+        L["Llama 3.2 — /api/chat"]
+    end
+
+    DOC --> ING
+    IDX <-->|read / write| META
+    IDX <-->|read / write| VEC
+    EMB <-->|HTTP / JSON| E
+    GEN <-->|HTTP / JSON| L
+    RET -->|search results| OUT["Terminal output — sources and scores"]
+    GEN -->|answer with citation markers| OUT
 ```
+
+### Component responsibilities
+
+| Layer | Implementation | Responsibility |
+| --- | --- | --- |
+| Interface | `main()`, `make_parser()` / argparse | Accept `index`, `search` and `ask` commands and expose configuration. |
+| Ingestion | `read_document_sections()` / pathlib, pypdf | Discover supported files recursively, extract text and preserve relative filenames and PDF page numbers. |
+| Chunking | `split_into_chunks()` | Split sections into 220-word windows with 40-word overlap by default. |
+| Model gateway | `ollama_post()` / requests | Centralize HTTP communication, connection/read timeouts and request error handling. |
+| Embedding | `embed_texts()`, `normalize_rows()` | Batch up to 12 texts per request and produce normalized float32 vectors using the configured embedding model. |
+| Persistence | `build_index()`, `load_index()` | Store and reload vectors, source records and index configuration using two local files. |
+| Retrieval | `retrieve()`, `rank_documents()` / NumPy | Embed the query using the indexed model, calculate cosine similarities and return top-k chunks (default 4). |
+| Generation | `generate_answer()`, `source_label()` | Build a grounded prompt with numbered sources and request a complete LLM response. |
+
+### Indexing pipeline (document preparation)
+
+Indexing runs explicitly when the user invokes `python rag.py index --docs docs`. It rebuilds the entire selected index rather than appending to it.
+
+```mermaid
+flowchart TD
+    A["Discover supported files"] --> B["Extract document text and PDF page numbers"]
+    B --> C["Split each section into overlapping chunks"]
+    C --> D["Create ordered chunk records"]
+    D --> E["Batch chunk texts — up to 12 per request"]
+    E --> F["Ollama /api/embed"]
+    F --> G["Validate and normalize vectors"]
+    G --> H["Combine batches into N x D matrix"]
+    D --> I["metadata.json — records and settings"]
+    H --> J["embeddings.npy — float32 matrix"]
+```
+
+Each PDF page is processed as its own section. Markdown and TXT files are processed as whole-file sections. The chunking algorithm advances by `chunk_size - overlap` words (180 by default). Embedding requests disable silent truncation, so oversized inputs can fail rather than lose content unnoticed.
+
+### Query-time pipeline
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant CLI as Python CLI
+    participant Store as Local index
+    participant Embed as Ollama embedding API
+    participant Rank as NumPy retrieval
+    participant Chat as Ollama chat API
+
+    User->>CLI: search or ask + question
+    CLI->>Store: Load metadata.json and embeddings.npy
+    Store-->>CLI: Records, embedding model, vectors
+    CLI->>Embed: POST /api/embed (question, stored model)
+    Embed-->>CLI: Question embedding
+    CLI->>Rank: Compare normalized query and document vectors
+    Rank-->>CLI: Top-k records and cosine scores
+    alt search
+        CLI-->>User: Ranked passages, scores and sources
+    else ask
+        Note over CLI: Assemble numbered excerpts and system instructions
+        CLI->>Chat: POST /api/chat (question + retrieved context)
+        Chat-->>CLI: Complete generated response
+        CLI-->>User: Answer and retrieved source labels
+    end
+```
+
+The search path does not invoke the generative model. This allows retrieval quality to be inspected independently of answer quality. The LLM receives the selected text passages, not the entire corpus or the vector matrix.
+
+### Data architecture
+
+The default index directory is `.rag_index/`:
+
+| File | Data | Purpose |
+| --- | --- | --- |
+| `metadata.json` | Index version, embedding model, chunk size, overlap and ordered chunk records | Recover the text and provenance associated with each vector. |
+| `embeddings.npy` | Two-dimensional NumPy float32 array with shape `(N, D)` | Store N chunk embeddings of dimension D for similarity search. |
+
+The position of each vector row corresponds to the position of its chunk record. For example, row 0 represents record 0. There is no database-generated identifier or independent vector record.
+
+Example chunk record (illustrative):
+
+```json
+{
+  "source": "policy.pdf",
+  "page": 2,
+  "part": 1,
+  "text": "Employees receive 25 days of annual leave."
+}
+```
+
+`page` is `null` for TXT and Markdown documents. Chunk numbering starts at 1 within each extracted section. Source, page and part are used to construct human-readable references.
+
+### Retrieval algorithm
+
+Document and query vectors are normalized to unit length. The cosine similarity between vectors a and b is their dot product divided by the product of their magnitudes. Once normalized, their dot product alone gives cosine similarity.
+
+```python
+scores = vectors @ query_vector
+top_indices = np.argsort(-scores)[:top_k]
+```
+
+The retrieval stage performs an exact scan across all N embeddings of dimension D. Scoring costs O(N × D), and the current full sorting step costs O(N log N). The raw float32 vector data takes approximately 4 × N × D bytes, excluding metadata and temporary arrays.
+
+No approximate nearest-neighbor index, lexical search, reranker or minimum relevance threshold is implemented. A high cosine score is not a probability of correctness.
+
+### Deployment and trust boundaries
+
+The default deployment consists of a Python CLI process, a local filesystem and an independently running Ollama server on the same machine. Models must be downloaded before use. The Ollama endpoint is configurable through `OLLAMA_BASE_URL`; configuring a remote endpoint sends the relevant text to that endpoint.
+
+| Boundary | Current behavior |
+| --- | --- |
+| Documents and index | Local unencrypted files; no database service or tenant separation. |
+| Model access | HTTP requests to localhost by default; no API key required for the default local setup. |
+| Input validation | Checks directory existence, supported extensions, chunk parameters, embedding counts, matrix shape and index version/count consistency. |
+| Grounding | Numbered excerpts, source labels and instructions to answer only from the retrieved context or acknowledge missing evidence. |
+| Failure handling | HTTP errors are translated into actionable runtime errors; selected exceptions produce CLI error output and a nonzero exit status. |
+
+Documents are untrusted data. Prompt instructions offer a basic mitigation against document-based prompt injection, but they do not enforce a security boundary or guarantee valid citations. The application has no authentication, encryption at rest, transactional index replacement, concurrent indexing protection or automated citation verification.
+
+### Architecture decisions and trade-offs
+
+| Decision | Rationale | Trade-off |
+| --- | --- | --- |
+| Direct Python instead of a RAG framework | Make the complete data flow and retrieval algorithm inspectable. | More code to maintain as capabilities grow. |
+| Separate embedding and chat models | Use a retrieval-specific model for similarity and an LLM for synthesis. | Both models must be installed and available. |
+| Word-based overlapping chunks | Simple, transparent and configurable. | Not token-aware or aligned to semantic boundaries. |
+| NumPy and JSON persistence | Minimal dependencies and no database infrastructure. | Loads the index into memory; two-file writes are not atomic. |
+| Exact cosine retrieval | Straightforward baseline without approximation error in nearest-neighbor ranking. | Query cost grows with corpus size; full sort adds overhead. |
+| Explicit full rebuild | Keeps the indexing workflow simple. | Re-embeds unchanged content; model changes require rebuilding. |
+| Top-k prompt grounding | Limits context to retrieved evidence and enables source references. | Irrelevant chunks may still be returned; grounding is not guaranteed. |
+
+### Evolution path
+
+The current system is a learning baseline, not a production service. An evolution path is to establish retrieval and answer evaluation first, add token-aware chunking and hybrid retrieval with reranking, then introduce incremental indexing and an ANN vector store when scale warrants it. A FastAPI service, access control, secure storage, structured observability and reliable index versioning can be added for multi-user deployment. These are proposed extensions, not existing features.
 
 ## Testing
 
